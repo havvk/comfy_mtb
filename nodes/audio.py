@@ -700,57 +700,199 @@ class MTB_AudioIsolateSpeaker(MtbAudio):
 
     def process_audio(
         self,
-        audio: AudioTensor,
-        whisper_data: WhisperData,
+        audio: dict, # 在ComfyUI中，AUDIO通常是字典
+        whisper_data: dict, # WHISPER_CHUNKS 也是字典
         target_speaker: str,
         mode: str = "isolate",
         fade_ms: float = 100.0,
-    ) -> tuple[AudioTensor]:
-        fade_samples = int((fade_ms / 1000.0) * audio["sample_rate"])
+    ) -> tuple[dict]: # 返回类型也是元组包含字典
+        print("\n--- MTB_AudioIsolateSpeaker: process_audio START ---")
+        print(f"原始输入 target_speaker: '{target_speaker}' (类型: {type(target_speaker)})")
+        print(f"原始输入 mode: '{mode}'")
+        print(f"原始输入 fade_ms: {fade_ms}")
+        
+        waveform = audio.get("waveform")
+        sample_rate = audio.get("sample_rate")
 
-        mask = (
-            torch.zeros_like(audio["waveform"])
-            if mode == "isolate"
-            else torch.ones_like(audio["waveform"])
-        )
+        if waveform is None or sample_rate is None:
+            print("错误: 音频数据无效 (waveform 或 sample_rate 为 None).")
+            # 返回一个有效的空/静音 AUDIO 对象
+            return ({ "waveform": torch.zeros((1,1,1)), "sample_rate": 44100 },)
 
-        for chunk in whisper_data["chunks"]:
-            if not chunk.get("speaker"):
+        print(f"输入 audio sample_rate: {sample_rate}, waveform shape: {waveform.shape}")
+
+        if not isinstance(waveform, torch.Tensor):
+            print(f"错误: audio['waveform'] 不是 torch.Tensor (实际类型: {type(waveform)}).")
+            return ({ "waveform": torch.zeros((1,1,1)), "sample_rate": sample_rate },)
+        if waveform.ndim != 3:
+            print(f"警告: audio['waveform'] 期望是3维 [batch, channels, samples], 但得到 {waveform.ndim} 维. 尝试调整.")
+            if waveform.ndim == 1: # samples -> 1,1,samples
+                waveform = waveform.unsqueeze(0).unsqueeze(0)
+            elif waveform.ndim == 2: # channels,samples -> 1,channels,samples or batch,samples -> batch,1,samples
+                                     # 假设是 channels,samples for now
+                waveform = waveform.unsqueeze(0)
+            else:
+                print(f"错误: 无法处理 {waveform.ndim} 维的 waveform.")
+                return ({ "waveform": torch.zeros((1,1,waveform.shape[-1] if waveform.ndim > 0 else 1)), "sample_rate": sample_rate },)
+            print(f"调整后 waveform shape: {waveform.shape}")
+            audio["waveform"] = waveform # 更新字典中的 waveform
+
+
+        # 仅打印 whisper_data 的摘要
+        if whisper_data and "chunks" in whisper_data:
+            print(f"输入 whisper_data: {len(whisper_data['chunks'])} chunks found. First chunk (摘要): {str(whisper_data['chunks'][0])[:200] if whisper_data['chunks'] else 'No chunks'}")
+        else:
+            print("输入 whisper_data 无效或不包含 'chunks'")
+
+        effective_target_speaker = ""
+        if isinstance(target_speaker, str):
+            effective_target_speaker = target_speaker.strip()
+        else:
+            print(f"警告: target_speaker 不是字符串 (实际类型: {type(target_speaker)}). 将视为空字符串处理.")
+        print(f"处理后的 effective_target_speaker: '{effective_target_speaker}'")
+
+        fade_samples = int((fade_ms / 1000.0) * sample_rate)
+
+        if mode == "isolate":
+            mask = torch.zeros_like(waveform)
+            print("模式: isolate. 初始化 mask 为全零.")
+        else:  # mode == "mute"
+            mask = torch.ones_like(waveform)
+            print("模式: mute. 初始化 mask 为全一.")
+
+        if not whisper_data or "chunks" not in whisper_data or not whisper_data["chunks"]:
+            print("警告: whisper_data 为空或不包含 'chunks'. 应用当前初始化的 mask.")
+            processed_waveform = waveform * mask
+            return ({ "sample_rate": sample_rate, "waveform": processed_waveform, },)
+
+        for i, chunk in enumerate(whisper_data["chunks"]):
+            print(f"\n  正在处理 Chunk {i+1}/{len(whisper_data['chunks'])}:")
+            print(f"    Chunk 内容 (摘要): {str(chunk)[:200]}")
+
+            current_chunk_speaker_original = chunk.get("speaker")
+            if not isinstance(current_chunk_speaker_original, str):
+                print(f"    警告: Chunk {i+1} 的 'speaker' 字段不是字符串 (实际: {type(current_chunk_speaker_original)}) 或不存在. 跳过此 chunk.")
+                continue
+            
+            current_chunk_speaker_cleaned = current_chunk_speaker_original.strip()
+            print(f"    Chunk speaker (原始): '{current_chunk_speaker_original}', (清理后): '{current_chunk_speaker_cleaned}'")
+
+            speaker_is_target = (effective_target_speaker == current_chunk_speaker_cleaned)
+            print(f"    比较: effective_target_speaker ('{effective_target_speaker}') == cleaned_chunk_speaker ('{current_chunk_speaker_cleaned}')? -> {speaker_is_target}")
+
+            timestamp = chunk.get("timestamp")
+            if not timestamp or not isinstance(timestamp, list) or len(timestamp) != 2:
+                print(f"    错误: Chunk {i+1} 的 'timestamp' 格式无效: {timestamp}. 跳过此 chunk.")
+                continue
+            
+            try:
+                start_time = float(timestamp[0])
+                end_time = float(timestamp[1])
+            except (ValueError, TypeError):
+                print(f"    错误: Chunk {i+1} 的 'timestamp' 值无法转换为浮点数: {timestamp}. 跳过此 chunk.")
                 continue
 
-            speaker_present = target_speaker in chunk["speaker"]
-            if (mode == "isolate" and speaker_present) or (
-                mode == "mute" and not speaker_present
-            ):
-                start_sample = int(
-                    chunk["timestamp"][0] * audio["sample_rate"]
-                )
-                end_sample = int(chunk["timestamp"][1] * audio["sample_rate"])
+            start_sample = int(start_time * sample_rate)
+            # 使用 waveform.shape[-1] 获取样本数维度
+            end_sample = min(int(end_time * sample_rate), waveform.shape[-1])
+            print(f"    时间戳: [{start_time:.2f}s, {end_time:.2f}s] -> 样本范围: [{start_sample}, {end_sample}]")
 
-                mask[:, start_sample:end_sample] = 1.0
+            if start_sample >= end_sample or start_sample >= waveform.shape[-1] or end_sample < 0:
+                print(f"    警告: Chunk {i+1} 计算得到的样本范围无效 ({start_sample}, {end_sample} vs {waveform.shape[-1]}). 跳过此 chunk.")
+                continue
+            
+            if mode == "isolate":
+                if speaker_is_target:
+                    print(f"    模式 isolate, 目标说话人匹配. mask[:, :, {start_sample}:{end_sample}] 设置为 1.0")
+                    mask[:, :, start_sample:end_sample] = 1.0
+                else:
+                    print(f"    模式 isolate, 目标说话人不匹配. mask[:, :, {start_sample}:{end_sample}] 保持 0.0")
+            elif mode == "mute":
+                if speaker_is_target:
+                    print(f"    模式 mute, 目标说话人匹配. mask[:, :, {start_sample}:{end_sample}] 设置为 0.0")
+                    mask[:, :, start_sample:end_sample] = 0.0
+                else:
+                    print(f"    模式 mute, 目标说话人不匹配. mask[:, :, {start_sample}:{end_sample}] 保持 1.0")
 
-        if fade_samples > 0:
-            fade = torch.linspace(0, 1, fade_samples)
+        print("\n  开始处理淡入淡出...")
+        if fade_samples > 0 and mask.numel() > 0 :
+            # 确保 mask 是3维 [batch, channels, samples] 且有足够的样本进行比较
+            if mask.ndim == 3 and mask.shape[0] > 0 and mask.shape[1] > 0 and mask.shape[2] > 1:
+                fade_device = waveform.device
+                fade_slope = torch.linspace(0, 1, fade_samples, device=fade_device)
+                
+                # 假设我们基于第一个批次和第一个通道的掩码来确定过渡
+                # 如果你的批次或通道数可能变化且行为需要不同，这里需要调整
+                batch_idx_for_transitions = 0
+                channel_idx_for_transitions = 0
+                
+                # active_mask_slice 是一维的，代表沿时间轴的掩码值
+                active_mask_slice = mask[batch_idx_for_transitions, channel_idx_for_transitions, :]
 
-            transitions = torch.where(mask[0, 1:] != mask[0, :-1])[0] + 1
+                if active_mask_slice.shape[0] > 1: # 确保有足够的样本来检测过渡
+                    # 找到掩码值变化的点 (0->1 或 1->0)
+                    # transitions 是一维张量，包含发生变化的索引 (相对于 active_mask_slice)
+                    transitions = torch.where(active_mask_slice[1:] != active_mask_slice[:-1])[0] + 1
+                    print(f"    找到 {len(transitions)} 个转变点在 batch {batch_idx_for_transitions}, channel {channel_idx_for_transitions}: {transitions.tolist()}")
+                else:
+                    transitions = torch.empty(0, dtype=torch.long, device=fade_device)
+                    print(f"    active_mask_slice 样本数 ({active_mask_slice.shape[0]}) 不足以计算转变点.")
 
-            for trans_idx in transitions:
-                if (
-                    trans_idx >= fade_samples
-                    and trans_idx <= mask.shape[1] - fade_samples
-                ):
-                    if mask[0, trans_idx] == 1:
-                        mask[:, trans_idx : trans_idx + fade_samples] *= fade
+                for trans_idx_tensor in transitions:
+                    trans_idx = trans_idx_tensor.item() # 从 tensor 获取 int 值
+                    print(f"    处理转变点索引: {trans_idx} (在 active_mask_slice 中)")
+
+                    # 状态改变发生在 trans_idx，即 active_mask_slice[trans_idx] 是新状态
+                    # active_mask_slice[trans_idx-1] 是旧状态
+                    
+                    new_state_at_transition = active_mask_slice[trans_idx]
+                    old_state_before_transition = active_mask_slice[trans_idx-1] if trans_idx > 0 else (1.0 - new_state_at_transition) # 假设开始处是相反状态
+
+                    # Fade-in: 从 0 (在 trans_idx-1) 变为 1 (在 trans_idx)
+                    if new_state_at_transition == 1.0 and old_state_before_transition == 0.0:
+                        # 淡入应用于 [trans_idx, trans_idx + fade_samples)
+                        start_fade_sample_idx = trans_idx
+                        end_fade_sample_idx = min(trans_idx + fade_samples, active_mask_slice.shape[0])
+                        
+                        if start_fade_sample_idx < end_fade_sample_idx: # 确保有实际长度应用fade
+                            current_fade_len = end_fade_sample_idx - start_fade_sample_idx
+                            print(f"      应用淡入: 范围 [{start_fade_sample_idx}, {end_fade_sample_idx}), 长度 {current_fade_len}")
+                            # 应用到原始三维mask的所有批次和通道
+                            # fade_slope 需要是 [1, 1, current_fade_len] 才能与 mask[:,:,slice] 相乘
+                            mask[:, :, start_fade_sample_idx : end_fade_sample_idx] *= fade_slope[:current_fade_len].view(1, 1, -1)
+                        else:
+                            print(f"      淡入范围无效或长度为0，跳过.")
+                    
+                    # Fade-out: 从 1 (在 trans_idx-1) 变为 0 (在 trans_idx)
+                    elif new_state_at_transition == 0.0 and old_state_before_transition == 1.0:
+                        # 淡出应用于 [trans_idx - fade_samples, trans_idx)
+                        start_fade_sample_idx = max(trans_idx - fade_samples, 0)
+                        end_fade_sample_idx = trans_idx
+                        
+                        if start_fade_sample_idx < end_fade_sample_idx: # 确保有实际长度应用fade
+                            current_fade_len = end_fade_sample_idx - start_fade_sample_idx
+                            print(f"      应用淡出: 范围 [{start_fade_sample_idx}, {end_fade_sample_idx}), 长度 {current_fade_len}")
+                            # fade.flip(0) 是从1到0的斜坡
+                            # 我们需要取这个斜坡的尾部，长度为 current_fade_len
+                            inverted_fade_slope = fade_slope.flip(0)
+                            mask[:, :, start_fade_sample_idx : end_fade_sample_idx] *= inverted_fade_slope[fade_samples - current_fade_len:].view(1, 1, -1)
+                        else:
+                            print(f"      淡出范围无效或长度为0，跳过.")
                     else:
-                        mask[:, trans_idx - fade_samples : trans_idx] *= (
-                            fade.flip(0)
-                        )
+                        print(f"      转变点 {trans_idx} 不是清晰的 0->1 或 1->0 转变. 新状态: {new_state_at_transition}, 旧状态: {old_state_before_transition}. 跳过对此转变点的淡化.")
+            else:
+                print(f"    mask 形状 ({mask.shape if mask is not None else 'None'}) 或 fade_samples ({fade_samples}) 不适合淡入淡出处理.")
+        elif mask.numel() == 0: # mask is not None but has no elements
+            print(f"    mask 为空 ({mask.shape if mask is not None else 'None'}). 跳过淡入淡出.")
+        else: # fade_samples == 0
+            print(f"    fade_samples ({fade_samples}) 为 0. 跳过淡入淡出.")
 
-        processed_waveform = audio["waveform"] * mask
 
+        processed_waveform = waveform * mask
+        print("--- MTB_AudioIsolateSpeaker: process_audio END ---")
         return (
             {
-                "sample_rate": audio["sample_rate"],
+                "sample_rate": sample_rate,
                 "waveform": processed_waveform,
             },
         )
